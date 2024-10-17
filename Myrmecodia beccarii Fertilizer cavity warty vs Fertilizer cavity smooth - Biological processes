@@ -1,0 +1,122 @@
+# Load required libraries
+library(DESeq2)
+library(GenomicFeatures)
+library(biomaRt)
+library(clusterProfiler)
+library(UniprotR)
+library(ggplot2)
+library(org.At.tair.db)
+
+# Set file paths
+counts_file_path <- "C:/Users/bop21gwh/Documents/PhD work/genomics/Hisat2/hisat2_mb.txt"
+meta_data_file_path <- "C:/Users/bop21gwh/Documents/PhD work/genomics/Hisat2/metadata.csv"
+gtf_annotation_path <- "C:/Users/bop21gwh/Documents/PhD work/genomics/Hisat2/cleaned_m.b_annotation.gtf"
+blast_output_path <- "C:/Users/bop21gwh/Documents/PhD work/genomics/Hisat2/blast_ATH_Mb_out.txt"
+
+# Step 1: Load count data and metadata
+raw_counts <- read.table(counts_file_path, header = TRUE, sep = "\t")
+filtered_counts <- raw_counts[, -c(2:8)]  # Remove unnecessary columns
+rownames(filtered_counts) <- filtered_counts$Geneid
+
+# Load metadata
+meta_data <- read.csv(meta_data_file_path)
+
+# Step 2: Filter metadata for species "M.b" and tissue types "Fertilizer_cavity_warty" and "Fertilizer_cavity_smooth"
+filtered_meta_data <- meta_data[meta_data$Species == "M.b" & 
+                                  meta_data$Tissue %in% c("Fertilizer_cavity_warty", "Fertilizer_cavity_smooth"), ]
+
+# View the filtered metadata to ensure it is correct
+print(filtered_meta_data)
+
+# Step 3: Ensure that count data matches filtered metadata
+# Get the sample names from filtered metadata
+filtered_sample_names <- filtered_meta_data$Sample  # Adjust this based on your actual sample identifier column
+print(filtered_sample_names)
+
+# Filter count data to only include samples present in metadata
+filtered_counts <- filtered_counts[, colnames(filtered_counts) %in% filtered_sample_names]
+print(filtered_counts)
+# Check dimensions
+cat("Count data dimensions:", dim(filtered_counts), "\n")
+cat("Metadata dimensions:", dim(filtered_meta_data), "\n")
+
+# Step 4: Create DESeq2 dataset using filtered metadata and perform DE analysis
+dds_filtered <- DESeqDataSetFromMatrix(
+  countData = round(filtered_counts),  # Ensure countData is rounded
+  colData = filtered_meta_data,
+  design = ~ Tissue  # Adjust this if needed
+)
+
+# Step 5: Perform DE analysis
+dds_filtered <- DESeq(dds_filtered)
+
+# Step 6: Load GTF file and map gene symbols
+txdb_filtered <- makeTxDbFromGFF(gtf_annotation_path, format = "gtf")
+res_filtered <- results(dds_filtered)
+res_filtered$symbol <- mapIds(txdb_filtered, keys = row.names(res_filtered), column = "GENEID", keytype = "GENEID", multiVals = "first")
+head(res_filtered)
+# Step 7: Load BLAST results and merge with DESeq2 results
+blast_output <- read.table(blast_output_path, header = FALSE, sep = "\t")
+colnames(blast_output) <- c("Query", "Subject", "Perc_Identity", "Alignment_Length", "Mismatches", 
+                            "Gap_Opens", "Query_Start", "Query_End", "Subject_Start", 
+                            "Subject_End", "E_value", "Bit_score")
+
+# Clean gene IDs in BLAST results
+blast_output$Query <- sub("\\.\\d+$", "", blast_output$Query)
+head(blast_output)
+
+# Merge DESeq2 results with BLAST results
+merged_results <- merge(as.data.frame(res_filtered), blast_output, by.x = "row.names", by.y = "Query", all.x = TRUE)
+head(merged_results)
+
+# Step 8: Map UniProt IDs to TAIR gene symbols using biomaRt
+ensembl_mart <- useMart("plants_mart", host = "https://plants.ensembl.org")
+ensembl_dataset <- useDataset("athaliana_eg_gene", mart = ensembl_mart)
+
+# Extract unique UniProt IDs from BLAST results (assuming 'Subject' contains UniProt IDs)
+uniprot_gene_list <- unique(blast_output$Subject)
+head(uniprot_gene_list)
+
+# Step 8: Map UniProt IDs to TAIR gene symbols using biomaRt
+uniprot_gene_mapping <- getBM(
+  attributes = c("uniprotswissprot", "tair_symbol"),
+  filters = "uniprotswissprot",
+  values = uniprot_gene_list,  # Now using the extracted list of UniProt IDs
+  mart = ensembl_dataset
+)
+
+# Extract TAIR symbols from the mapping (assuming some UniProt IDs might not have matches)
+uniprot_mapped_genes <- na.omit(uniprot_gene_mapping$tair_symbol)
+head(uniprot_mapped_genes)
+
+# Step 9: Map TAIR gene symbols to TAIR locus IDs
+tair_locus_mapping <- getBM(
+  attributes = c("tair_symbol", "tair_locus"), 
+  filters = "tair_symbol", 
+  values = uniprot_mapped_genes,  # Now using the mapped TAIR symbols
+  mart = ensembl_dataset
+)
+
+# Step 10: Perform GO enrichment analysis
+tair_ids <- na.omit(tair_locus_mapping$tair_locus) #####
+
+go_enrichment <- enrichGO(
+  gene = tair_ids,       
+  OrgDb = org.At.tair.db,
+  keyType = "TAIR",             
+  ont = "BP",                   
+  pAdjustMethod = "BH",
+  qvalueCutoff = 0.05,
+  readable = TRUE               
+)
+
+# Visualize the top 10 enriched terms
+dotplot(go_enrichment, showCategory = 20) + 
+  ggtitle("Myrmecodia beccarii Fertilizer cavity warty vs Fertilizer cavity smooth - Biological processes") +
+  theme(plot.title = element_text(hjust = 0.5))
+
+# Step 11: Run KEGG enrichment analysis using UniProt IDs
+Enrichment.KEGG(Accs = uniprot_gene_list, 
+                OS = "athaliana",    
+                p_value = 0.05,      
+                top = 10)
